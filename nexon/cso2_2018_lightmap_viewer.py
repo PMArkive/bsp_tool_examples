@@ -8,6 +8,8 @@
 # ///
 
 # https://dearpygui.readthedocs.io/en/latest/index.html
+# https://github.com/jakgor471/BSPEntSpy/blob/main/src/bspentspy/LightmapViewer.java
+# bsp_tool.lightmaps.source.face_lightmaps
 
 
 from typing import Any, Dict, List
@@ -19,6 +21,8 @@ import bsp_tool
 
 
 # TODO: free texture when deleted
+# TODO: keep texture pixelated at scale (not possible w/ dearpygui?)
+# TODO: RGBE colour picker / inspector
 class Viewer:
     bsp: bsp_tool.base.Bsp
     tags: Dict[str, Any]
@@ -27,27 +31,44 @@ class Viewer:
         self.bsp = None
         # TODO: HDR equation controls (sliders & data)
         self.data = {
+            "exposure": 0,
             "face_index": 0,
             "ldr": False,
             "hdr": False}
         self.tags = {
             "image": None,
             "slider.face": None,
+            "slider.exposure": None,
             "texture": None}
 
     def face_texels(self) -> np.array:
+        """get raw texels of target face"""
         face = self.bsp.FACES[self.data["face_index"]]
         if face.light_offset == -1 or face.styles == -1:
             return None  # face is not lightmapped
         width, height = map(int, [s + 1 for s in face.lightmap.size])
+        if face.displacement_info != -1:
+            width, height = width * 2, height * 2
         start, length = face.light_offset, width * height * 4
         # TODO: UI controls to select LDR/HDR + A/B/C/D + style index
         # -- offsets = [start + (length * i) for i in range(4)]  # ABCD
         # -- if out.data["hdr"]: lump = self.bsp.LIGHTING_HDR
         # -- if out.data["ldr"]: lump = self.bsp.LIGHTING
         texels = bytes(self.bsp.LIGHTING[start:start + length])  # LDR.A
-        out = (np.frombuffer(texels, dtype=np.uint8) / 255).astype(np.float32)
-        return out.reshape((width, height, 4))
+        return np.frombuffer(texels, dtype=np.uint8).reshape(width, height, 4)
+
+    def apply_exposure(self, texels: np.array) -> np.array:
+        """HDR RGBE_8888 -> LDR RGBA_FLOAT"""
+        width, height = texels.shape[:2]
+        # pixel edits
+        rgb = texels[:, :, :3] / 255
+        e = (texels[:, :, 3].astype(np.int16) - 128) / 128
+        out = rgb * (1 + self.data["exposure"])
+        out = out * (2 ** e).transpose().reshape(width, height, 1)
+        out = out.astype(np.float32).clip(min=0.0, max=1.0)
+        out = np.insert(out, 3, 1.0, axis=2)  # Alpha = 1.0
+        # out = np.insert(rgb, 3, 1.0, axis=2)  # no exposure
+        return out
 
     def pixels(self) -> np.array:
         width, height = 128, 128
@@ -58,17 +79,11 @@ class Viewer:
         texture_floats = texture_floats.reshape(width, height, 4)
         sub_image = self.face_texels()
         if sub_image is not None:
-            # TODO: HDR exponent scaling
-            # -- RGB = RGB * (A * 255)
-            # -- remap_to_ldr(RGB, ...)
-            # -- A = 1.0
             sub_width, sub_height = sub_image.shape[:2]
             assert sub_width <= 128
             assert sub_height <= 128
+            sub_image = self.apply_exposure(sub_image)
             texture_floats[:sub_width, :sub_height] = sub_image
-        else:
-            # TODO: update a UI indicator for no lightmap available
-            ...
         return texture_floats.flatten()
 
     def update(self):
@@ -76,6 +91,10 @@ class Viewer:
         imgui.set_value(self.tags["texture"], self.pixels())
 
     # callbacks
+    def exposure_callback(self):
+        self.data["exposure"] = imgui.get_value(self.tags["slider.exposure"])
+        self.update()
+
     def face_callback(self):
         self.data["face_index"] = imgui.get_value(self.tags["slider.face"])
         self.update()
@@ -106,6 +125,8 @@ class Viewer:
                 default_value=texture_floats,
                 format=imgui.mvFormat_Float_rgba)
         # UI layout
+        # TODO: increment / decrement face index w/ arrow keys
+        # TODO: zoom control (slider / hotkeys)
         with imgui.child_window(parent=parent):
             with imgui.group(horizontal=True):
                 with imgui.group(width=192):
@@ -114,15 +135,16 @@ class Viewer:
                         min_value=0,
                         max_value=len(out.bsp.FACES) - 1,
                         callback=out.face_callback)
-                    # TODO: HDR equation controls
+                    out.tags["slider.exposure"] = imgui.add_slider_float(
+                        label="Exposure",
+                        min_value=0.0,
+                        max_value=4.0,
+                        callback=out.exposure_callback)
                 with imgui.group():
-                    width, height = [128 * 4, 128 * 4]
+                    width, height = [128 * 6, 128 * 6]
                     out.tags["image"] = imgui.add_image(
                         out.tags["texture"],
                         width=width, height=height)
-                    # TODO: zoom
-                    # -- on scroll
-                    # -- slider
         # load face lightmap texture
         out.update()
         return out
@@ -142,8 +164,7 @@ def main(*args: List[str]):
         # NOTE: case-sensitive, idk why
         imgui.add_file_extension("CS:O2 Map (*.bsp){.bsp}")
 
-    # NOTE: forcing 4k min size to ensure we fill the viewport
-    with imgui.window(tag="main", min_size=(4096, 4096)):
+    with imgui.window(tag="main"):
         with imgui.menu_bar():
             imgui.add_menu_item(
                 label="Open",
